@@ -2563,7 +2563,10 @@ impl Controller {
         let Some(node) = self.tree.selected() else {
             return Effects::noop();
         };
-        if self.tree.changed_only() {
+        // During an asynchronous re-root refresh, the fresh tree has not received its
+        // changed-only filter yet. The controller's carried mode state is authoritative during
+        // that interval, so c/d cannot briefly fall through to normal-tree walk-up behavior.
+        if self.changed_only || self.status_mode {
             if node.kind == NodeKind::Dir {
                 self.tree.collapse(&node.path);
                 return Effects::redraw();
