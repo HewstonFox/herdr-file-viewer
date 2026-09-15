@@ -403,7 +403,7 @@ fn configured_filter_driver_names(out: &[u8]) -> BTreeSet<Vec<u8>> {
         let Some(last_dot) = key.iter().rposition(|byte| *byte == b'.') else {
             continue;
         };
-        if last_dot <= 7 {
+        if last_dot < 7 {
             continue;
         }
         let field = &key[last_dot + 1..];
@@ -859,6 +859,21 @@ mod tests {
                 b"simple".to_vec(),
                 b"with.dots".to_vec(),
             ])
+        );
+    }
+
+    #[test]
+    fn empty_filter_driver_is_neutralized() {
+        let overrides = filter_overrides_from_config(b"filter..clean\0filter..process\0").unwrap();
+        assert_eq!(
+            overrides,
+            [
+                "filter..clean=",
+                "filter..smudge=",
+                "filter..process=",
+                "filter..required=false"
+            ]
+            .map(OsString::from)
         );
     }
 

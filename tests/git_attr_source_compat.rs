@@ -220,6 +220,56 @@ fn old_git_compat_keeps_awareness_and_diffs_without_executing_filters() {
         "process-filter path must return a real correct diff: {process_diff:?}"
     );
 
+    // Git accepts an empty filter subsection and selects it with `filter=`.
+    fs::write(
+        repo.path().join(".gitattributes"),
+        "clean.txt filter=\nprocess.txt filter=\n",
+    )
+    .unwrap();
+    git(repo.path(), &["config", "filter..required", "true"]);
+    for field in ["clean", "process"] {
+        git(
+            repo.path(),
+            &[
+                "config",
+                &format!("filter..{field}"),
+                payloads
+                    .path()
+                    .join(format!("{field}-filter.sh"))
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+        let empty_filter_status = status(repo.path());
+        let empty_filter_diff = diff(
+            repo.path(),
+            Path::new("clean.txt"),
+            Baseline::Head,
+            None,
+            false,
+        );
+        assert!(
+            !clean_marker.exists(),
+            "empty clean driver must not execute"
+        );
+        assert!(
+            !process_marker.exists(),
+            "empty process driver must not execute"
+        );
+        assert_eq!(
+            empty_filter_status.get(Path::new("clean.txt")),
+            Some(&Status::Modified)
+        );
+        assert_eq!(
+            empty_filter_status.get(Path::new("process.txt")),
+            Some(&Status::Modified)
+        );
+        assert!(
+            empty_filter_diff.contains("-clean-a") && empty_filter_diff.contains("+clean-b"),
+            "empty {field} driver must preserve diffs: {empty_filter_diff:?}"
+        );
+    }
+
     // A name that cannot be represented by `-c key=value` must refuse the query.
     git(
         repo.path(),
