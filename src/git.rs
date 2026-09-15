@@ -450,6 +450,10 @@ fn filter_overrides_from_config(output: &[u8]) -> Option<Vec<OsString>> {
             ["clean", "smudge", "process", "required"]
                 .into_iter()
                 .map(move |field| {
+                    // Git splits `-c key=value` at the first equals sign.
+                    if driver.contains(&b'=') {
+                        return None;
+                    }
                     let mut arg = b"filter.".to_vec();
                     arg.extend_from_slice(&driver);
                     arg.push(b'.');
@@ -855,6 +859,13 @@ mod tests {
                 b"simple".to_vec(),
                 b"with.dots".to_vec(),
             ])
+        );
+    }
+
+    #[test]
+    fn equals_in_filter_driver_refuses_entire_inventory() {
+        assert!(
+            filter_overrides_from_config(b"filter.normal.clean\0filter.probe=x.clean\0").is_none()
         );
     }
 

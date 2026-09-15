@@ -219,4 +219,34 @@ fn old_git_compat_keeps_awareness_and_diffs_without_executing_filters() {
         process_diff.contains("-process-a") && process_diff.contains("+process-b"),
         "process-filter path must return a real correct diff: {process_diff:?}"
     );
+
+    // A name that cannot be represented by `-c key=value` must refuse the query.
+    git(
+        repo.path(),
+        &[
+            "config",
+            "filter.hostile=clean.clean",
+            payloads.path().join("clean-filter.sh").to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        repo.path().join(".gitattributes"),
+        "clean.txt filter=hostile=clean\n",
+    )
+    .unwrap();
+    assert!(status(repo.path()).is_empty());
+    assert!(
+        diff(
+            repo.path(),
+            Path::new("clean.txt"),
+            Baseline::Head,
+            None,
+            false
+        )
+        .is_empty()
+    );
+    assert!(
+        !clean_marker.exists(),
+        "unrepresentable driver must not execute"
+    );
 }
