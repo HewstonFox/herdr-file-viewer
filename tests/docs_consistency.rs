@@ -23,6 +23,7 @@ const SECURITY: &str = include_str!("../SECURITY.md");
 const ARCHITECTURE: &str = include_str!("../ARCHITECTURE.md");
 const AGENT_SKILL: &str = include_str!("../skills/herdr-file-viewer/SKILL.md");
 const OPEN_PANE_SCRIPT: &str = include_str!("../scripts/open-file-viewer.sh");
+const OPEN_PANE_PS1: &str = include_str!("../scripts/open-file-viewer.ps1");
 const OPEN_TAB_SCRIPT: &str = include_str!("../scripts/open-file-viewer-tab.sh");
 
 /// The `--cwd` drift guard (#139).
@@ -80,6 +81,37 @@ fn no_documented_launch_passes_cwd_to_plugin_pane_open() {
     );
 }
 
+/// The `open_direction` drift guard.
+///
+/// The key only does anything while the launchers ASK for it. Re-hardcode the flag and every other
+/// trace of the feature survives — the `Config` field, the docs, the `?` Settings row, the resolver
+/// tests — while the setting itself becomes a silent no-op, which is the failure mode the `--cwd`
+/// guard above was written for. So pin the shape: the split launchers probe, and the tab launcher
+/// (a tab has no direction) does not.
+#[test]
+fn split_launchers_take_the_direction_from_the_open_direction_probe() {
+    for (name, script) in [
+        ("scripts/open-file-viewer.sh", OPEN_PANE_SCRIPT),
+        ("scripts/open-file-viewer.ps1", OPEN_PANE_PS1),
+    ] {
+        assert!(
+            script.contains("--open-direction"),
+            "{name} must ask the viewer binary for the configured open_direction"
+        );
+        for hardcoded in ["--direction right", "'--direction', 'right'"] {
+            assert!(
+                !script.contains(hardcoded),
+                "{name} hardcodes `{hardcoded}`, which makes the open_direction config key a \
+                 silent no-op. Pass the probed value instead."
+            );
+        }
+    }
+    assert!(
+        !OPEN_TAB_SCRIPT.contains("--direction"),
+        "the tab launcher opens a tab, which has no direction — it must not grow a --direction flag"
+    );
+}
+
 /// Whether `example` has a commented-out TOML assignment for `key` (a line that, after its leading
 /// `#`, reads `key = ...`). Stronger than a bare substring: the key must appear as an actual
 /// (commented) assignment, not merely as a word in prose.
@@ -117,6 +149,7 @@ fn config_example_documents_every_config_key() {
         "tree_width",
         "tree_position",
         "tree_max_cols",
+        "open_direction",
         "preview_max_lines",
         "preview_max_kib",
     ] {

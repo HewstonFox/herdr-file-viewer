@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-09-14
+
+### Added
+- `open_direction`: choose which way the summon key splits your pane — `"right"` (the default, viewer beside your work) or `"down"`, which keeps the terminal on top and puts the viewer underneath. `"bottom"` is accepted as a synonym. The tab action is unaffected, and the launcher reads it per summon, so the next `prefix+f` obeys it with no reload. → [configuration](docs/configuration.md) · [summoning](docs/summoning.md#split-beside-or-below)
+
 ## [1.16.0] - 2026-08-15
 
 ### Added
