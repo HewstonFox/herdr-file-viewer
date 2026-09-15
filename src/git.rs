@@ -436,7 +436,8 @@ fn configured_filter_overrides(repo_root: &Path) -> Option<Vec<OsString>> {
     // `git config --get-regexp` returns 1 for no matches. Every other failure is unsafe to
     // interpret as "no filters": fail closed rather than running the requested repo query with
     // an incomplete inventory.
-    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
+    let no_matches = output.status.code() == Some(1) && output.stdout.is_empty();
+    if !(output.status.success() || no_matches) {
         return None;
     }
 
