@@ -1,8 +1,9 @@
 //! #160: a git that rejects `--attr-source` (Apple Git 2.39.x) must still activate
-//! git awareness. Own integration binary so the process-wide probe cache starts unset
-//! and sees the wrapper before any other test in this crate can pin it.
+//! git awareness without letting repository attributes/configuration execute filters.
+//! Own integration binary so the process-wide probe cache starts unset and sees the
+//! wrapper before any other test in this crate can pin it.
 //!
-//! Unix-only: the wrapper is a shell script prepended to `PATH`. Windows CI uses a
+//! Unix-only: the wrapper and hostile filter fixtures are shell scripts. Windows CI uses a
 //! current Git for Windows (2.40+), so this Apple-git path is not the failure mode there.
 
 #![cfg(unix)]
@@ -11,13 +12,15 @@ mod common;
 
 use common::{TempDir, canon, git, init_repo_with_commit};
 use herdr_file_viewer::context::LaunchContext;
-use herdr_file_viewer::git::{Status, current_branch, status};
+use herdr_file_viewer::git::{Baseline, Status, current_branch, diff, status};
 use herdr_file_viewer::root::resolve;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Locate the real `git` *before* we prepend a wrapper to `PATH`.
 fn real_git_path() -> PathBuf {
@@ -33,9 +36,15 @@ fn real_git_path() -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+fn make_executable(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 /// A `git` that fails if `--attr-source` is present (Apple Git 2.39 behaviour) and
 /// otherwise execs the real binary. The probe (`git --attr-source=… --version`) hits
-/// this first, so the viewer omits the flag and the forwarded commands succeed.
+/// this first, so the viewer takes its older-git compatibility path.
 fn install_attr_source_rejecting_wrapper(dir: &Path, real_git: &Path) {
     let wrapper = dir.join("git");
     let script = format!(
@@ -49,14 +58,71 @@ fn install_attr_source_rejecting_wrapper(dir: &Path, real_git: &Path) {
         real_git.display()
     );
     fs::write(&wrapper, script).unwrap();
-    let mut perms = fs::metadata(&wrapper).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&wrapper, perms).unwrap();
+    make_executable(&wrapper);
+}
+
+fn install_hostile_filters(repo: &Path, payloads: &Path) -> (PathBuf, PathBuf) {
+    let clean_marker = payloads.join("CLEAN_EXECUTED");
+    let process_marker = payloads.join("PROCESS_EXECUTED");
+    let clean_script = payloads.join("clean-filter.sh");
+    let process_script = payloads.join("process-filter.sh");
+
+    // The clean driver is a byte-for-byte pass-through; the process driver only marks and exits.
+    // Both are configured as required below, so correct status/diff also proves the hardening
+    // neutralized `required`, not merely the executable command.
+    fs::write(
+        &clean_script,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", clean_marker.display()),
+    )
+    .unwrap();
+    fs::write(
+        &process_script,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", process_marker.display()),
+    )
+    .unwrap();
+    make_executable(&clean_script);
+    make_executable(&process_script);
+
+    fs::write(
+        repo.join(".gitattributes"),
+        "clean.txt filter=hostile-clean\nprocess.txt filter=hostile-process\n",
+    )
+    .unwrap();
+    git(
+        repo,
+        &[
+            "config",
+            "filter.hostile-clean.clean",
+            clean_script.to_str().unwrap(),
+        ],
+    );
+    git(
+        repo,
+        &[
+            "config",
+            "filter.hostile-process.process",
+            process_script.to_str().unwrap(),
+        ],
+    );
+    git(repo, &["config", "filter.hostile-clean.required", "true"]);
+    git(repo, &["config", "filter.hostile-process.required", "true"]);
+    (clean_marker, process_marker)
+}
+
+/// Force Git past its stat-cache shortcut after a same-byte-length edit. This makes status
+/// content-check both tracked paths and deterministically reaches clean/process conversion.
+fn rewrite_with_distinct_mtime(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    let touched = Command::new("touch")
+        .args(["-t", "200001010000.00"])
+        .arg(path)
+        .status()
+        .expect("run touch");
+    assert!(touched.success(), "force fixture mtime");
 }
 
 /// Restores `PATH` on drop so a panic mid-test cannot leak the wrapper into later
-/// commands in this process (this binary has only one test, but Drop is the honest
-/// cleanup).
+/// commands in this process (this binary has only one test, but Drop is the honest cleanup).
 struct RestorePath(OsString);
 
 impl Drop for RestorePath {
@@ -68,13 +134,18 @@ impl Drop for RestorePath {
 }
 
 #[test]
-fn apple_git_style_unknown_attr_source_still_activates_git_awareness() {
+fn old_git_compat_keeps_awareness_and_diffs_without_executing_filters() {
     let repo = TempDir::new();
     init_repo_with_commit(repo.path());
-    fs::write(repo.path().join("f.py"), "a\n").unwrap();
-    git(repo.path(), &["add", "f.py"]);
-    git(repo.path(), &["commit", "-q", "-m", "init"]);
-    fs::write(repo.path().join("f.py"), "a\nb\n").unwrap();
+    fs::write(repo.path().join("clean.txt"), "clean-a\n").unwrap();
+    fs::write(repo.path().join("process.txt"), "process-a\n").unwrap();
+    git(repo.path(), &["add", "clean.txt", "process.txt"]);
+    git(repo.path(), &["commit", "-q", "-m", "tracked fixtures"]);
+
+    let payloads = TempDir::new();
+    let (clean_marker, process_marker) = install_hostile_filters(repo.path(), payloads.path());
+    rewrite_with_distinct_mtime(&repo.path().join("clean.txt"), "clean-b\n");
+    rewrite_with_distinct_mtime(&repo.path().join("process.txt"), "process-b\n");
 
     let real_git = real_git_path();
     let bin = TempDir::new();
@@ -82,10 +153,7 @@ fn apple_git_style_unknown_attr_source_still_activates_git_awareness() {
 
     // Sanity: the wrapper itself rejects the flag the way Apple Git 2.39 does.
     let probe = Command::new(bin.path().join("git"))
-        .args([
-            "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-            "--version",
-        ])
+        .args([format!("--attr-source={EMPTY_TREE}"), "--version".into()])
         .output()
         .expect("run wrapper probe");
     assert!(!probe.status.success(), "wrapper must reject --attr-source");
@@ -106,7 +174,29 @@ fn apple_git_style_unknown_attr_source_still_activates_git_awareness() {
     });
     let map = status(repo.path());
     let branch = current_branch(repo.path());
+    let clean_diff = diff(
+        repo.path(),
+        Path::new("clean.txt"),
+        Baseline::Head,
+        None,
+        false,
+    );
+    let process_diff = diff(
+        repo.path(),
+        Path::new("process.txt"),
+        Baseline::Head,
+        None,
+        false,
+    );
 
+    assert!(
+        !clean_marker.exists(),
+        "older-git compatibility must not execute a configured clean filter"
+    );
+    assert!(
+        !process_marker.exists(),
+        "older-git compatibility must not execute a configured process filter"
+    );
     assert!(
         resolved.is_git_repo,
         "#160: a git that rejects --attr-source must still be detected as a repo"
@@ -115,13 +205,18 @@ fn apple_git_style_unknown_attr_source_still_activates_git_awareness() {
         resolved.repo_root.as_ref().map(|p| canon(p)),
         Some(canon(repo.path()))
     );
-    assert_eq!(
-        map.get(&PathBuf::from("f.py")),
-        Some(&Status::Modified),
-        "#160: status markers must populate"
-    );
+    assert_eq!(map.get(Path::new("clean.txt")), Some(&Status::Modified));
+    assert_eq!(map.get(Path::new("process.txt")), Some(&Status::Modified));
     assert!(
         branch.is_some(),
         "#160: current branch must resolve for the tree border"
+    );
+    assert!(
+        clean_diff.contains("-clean-a") && clean_diff.contains("+clean-b"),
+        "clean-filter path must return a real correct diff: {clean_diff:?}"
+    );
+    assert!(
+        process_diff.contains("-process-a") && process_diff.contains("+process-b"),
+        "process-filter path must return a real correct diff: {process_diff:?}"
     );
 }
