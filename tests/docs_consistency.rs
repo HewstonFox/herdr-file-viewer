@@ -81,23 +81,17 @@ fn no_documented_launch_passes_cwd_to_plugin_pane_open() {
     );
 }
 
-/// The `open_direction` drift guard.
-///
-/// The key only does anything while the launchers ASK for it. Re-hardcode the flag and every other
-/// trace of the feature survives — the `Config` field, the docs, the `?` Settings row, the resolver
-/// tests — while the setting itself becomes a silent no-op, which is the failure mode the `--cwd`
-/// guard above was written for. So pin the shape: the split launchers probe, and the tab launcher
-/// (a tab has no direction) does not.
+/// Static complement to the executable config-to-launcher handoff tests in
+/// `tests/open_direction.rs`: split launchers must not re-hardcode the old default, and the tab
+/// launcher must stay outside this pane-only setting. Whether each split launcher actually probes
+/// the binary is proved by executing it, not by searching raw script text where comments can satisfy
+/// a `contains` assertion.
 #[test]
-fn split_launchers_take_the_direction_from_the_open_direction_probe() {
+fn split_launchers_do_not_hardcode_direction_and_tab_has_none() {
     for (name, script) in [
         ("scripts/open-file-viewer.sh", OPEN_PANE_SCRIPT),
         ("scripts/open-file-viewer.ps1", OPEN_PANE_PS1),
     ] {
-        assert!(
-            script.contains("--open-direction"),
-            "{name} must ask the viewer binary for the configured open_direction"
-        );
         for hardcoded in ["--direction right", "'--direction', 'right'"] {
             assert!(
                 !script.contains(hardcoded),
