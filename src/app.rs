@@ -102,9 +102,10 @@ pub fn run(open_flag: Option<String>) -> io::Result<()> {
     // as the live components below so the overlay shows what's actually in effect.
     let settings_wired = settings_wired(&eff, current_os_kind(), platform_editor);
 
-    // `Controller::new` now consumes `resolved` by value; `baseline` was already built from it
-    // above (`git::default_baseline(&resolved)`), so moving it here is the last use.
-    let mut controller = Controller::new(
+    // Seed the changed-file view policy during construction so the first render is dispatched in
+    // its final mode (the single worker cannot cancel a job it has already started). `baseline`
+    // was already built from `resolved` above, so moving the resolved root here is its last use.
+    let mut controller = Controller::new_with_changed_file_view(
         resolved,
         baseline,
         Components {
@@ -113,6 +114,7 @@ pub fn run(open_flag: Option<String>) -> io::Result<()> {
             clipboard,
             renderers: Some(renderers),
         },
+        eff.changed_file_view,
     );
     // Apply the config-driven startup hide-dotfiles default (AC-9). The interactive `.` toggle
     // still flips it later.
@@ -248,12 +250,12 @@ fn event_loop(terminal: &mut DefaultTerminal, controller: &mut Controller) -> io
             terminal.draw(|frame| {
                 controller.set_width(frame.area().width);
                 let view: ViewState = controller.view_state();
-                let (cw, ch) = presenter::draw(frame, &view);
+                let viewports = presenter::draw(frame, &view);
                 // Feed the drawn content viewport back so content scrolling can be clamped to
                 // it on the next intent, and the hit-test geometry so a mouse event maps to the
                 // live layout. `true` means a deferred launch-open zoom just armed (narrow
                 // tree-only pane) and we must paint again so the file is actually visible.
-                need_redraw = controller.set_content_viewport(cw, ch);
+                need_redraw = controller.set_preview_viewports(viewports);
                 controller.set_pane_geometry(presenter::geometry(frame.area(), &view));
             })?;
             dirty = need_redraw;

@@ -7,8 +7,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-09-15
+
+### Added
+- `open_direction`: choose which way the summon key splits your pane — `"right"` (the default, viewer beside your work) or `"down"`, which keeps the terminal on top and puts the viewer underneath. `"bottom"` is accepted as a synonym. The tab action is unaffected, and the launcher reads it per summon, so the next `prefix+f` obeys it with no reload. → [configuration](docs/configuration.md) · [summoning](docs/summoning.md#split-beside-or-below)
+
 ### Fixed
-- `←`/`h` on a file, or on a directory that's already collapsed, no longer no-ops. It now walks up to the nearest visible ancestor directory and collapses that instead, so repeated presses climb the tree one level at a time — including under `compact_dirs`, where it correctly skips past every folded intermediate directory to land on the next real row. → [usage](docs/usage.md#the-tree) · [keys](docs/keys.md)
+- Restore Git status, branch, and diffs on git 2.39 (Apple’s Xcode git), while disabling configured filter commands. Thanks @arykhoda (#160) → [usage](docs/usage.md#git-awareness) · [install](docs/install.md)
+
+## [1.16.0] - 2026-08-15
+
+### Added
+- Pinned preview: press `p` on a settled file to freeze it on the right while you keep browsing on the left. `p` again unpins it, or press `p` on another file to replace it. `Tab` moves between the tree, the active file, and the pin. Hold a file from one worktree and switch (`W`) to compare it with another. → [usage](docs/usage.md#pinned-previews) · [keys](docs/keys.md)
+- `changed_file_view`: choose whether existing Git-changed files initially open as diffs (default) or in their normal rendered Markdown/syntax-content view; deleted paths stay diff-first, and `v` still cycles through the diff views. Thanks @umutciloglu (#146) → [configuration](docs/configuration.md) · [usage](docs/usage.md#viewing-a-file)
+
+### Fixed
 - Agent skill: the launch instructions no longer tell agents to pass `--cwd`. herdr resolves the manifest's relative pane command against it, so the launch failed with `plugin_pane_open_failed` — or worse, inside a built plugin checkout, silently ran that checkout's binary. The skill and the `docs/usage.md` snippet now explain that the viewed root follows the *focused herdr pane's* directory, so an agent's own `cd` does not move it. Thanks @AntonyKor (#139) → [agent skill](skills/herdr-file-viewer/SKILL.md) · [usage](docs/usage.md#teach-your-agent)
 
 ## [1.15.0] - 2026-08-03

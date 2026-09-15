@@ -22,7 +22,7 @@ use herdr_file_viewer::update::spotlight_policy::{
     SpotlightCache, SpotlightInput, cache_delta, project,
 };
 use herdr_file_viewer::update::{NoticeSnapshot, UpdateState, Version};
-use herdr_file_viewer::view_policy::ViewMode;
+use herdr_file_viewer::view_policy::{ChangedFileView, ViewMode};
 use ratatui::layout::Rect;
 use ratatui::text::Text;
 use std::cell::RefCell;
@@ -131,6 +131,16 @@ fn controller(
     git: StubGit,
     editor_fails: bool,
 ) -> (Controller, Recorder<Baseline>, Recorder<PathBuf>) {
+    controller_with_changed_file_view(root, is_git_repo, git, editor_fails, ChangedFileView::Diff)
+}
+
+fn controller_with_changed_file_view(
+    root: &Path,
+    is_git_repo: bool,
+    git: StubGit,
+    editor_fails: bool,
+    changed_file_view: ChangedFileView,
+) -> (Controller, Recorder<Baseline>, Recorder<PathBuf>) {
     let changed_calls = git.changed_calls.clone();
     let opened = Arc::new(Mutex::new(Vec::new()));
     let git: Arc<dyn GitService> = Arc::new(git); // build the stub Arc once; clone it inside the factory
@@ -147,10 +157,11 @@ fn controller(
         clipboard: Box::new(common::RecordingClipboard::default()),
         renderers: None,
     };
-    let ctrl = Controller::new(
+    let ctrl = Controller::new_with_changed_file_view(
         common::resolved(root.to_path_buf(), is_git_repo),
         Baseline::Head,
         components,
+        changed_file_view,
     );
     (ctrl, changed_calls, opened)
 }
@@ -324,7 +335,7 @@ fn apply_hide_dotfiles_at_startup_re_renders_so_content_matches_the_new_selectio
     // Drain until content lands, then require the body to belong to the SAME file as the title.
     await_marker(&mut ctrl, "BODY-OF:");
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("keep.txt"),
         "the title reflects the visible selection"
     );
@@ -724,6 +735,237 @@ fn cycle_view_on_a_changed_file_reaches_the_full_context_diff() {
         ctrl.selected_view_mode(),
         Some(ViewMode::Diff),
         "cycle wraps back to the compact diff"
+    );
+}
+
+#[test]
+fn configured_content_view_starts_changed_files_in_their_normal_file_type_mode() {
+    let unchanged = TempDir::new();
+    std::fs::write(unchanged.path().join("plain.rs"), "fn plain() {}\n").unwrap();
+    let (unchanged_ctrl, _, _) = controller_with_changed_file_view(
+        unchanged.path(),
+        false,
+        StubGit::default(),
+        false,
+        ChangedFileView::Content,
+    );
+    assert_eq!(
+        unchanged_ctrl.render_seq(),
+        1,
+        "the configured preference does not duplicate an unchanged non-Git render"
+    );
+
+    let markdown = TempDir::new();
+    std::fs::write(markdown.path().join("README.md"), "# Changed\n").unwrap();
+    let mut md_changed = BTreeMap::new();
+    md_changed.insert(PathBuf::from("README.md"), Status::Modified);
+    let md_git = StubGit {
+        status: md_changed.clone(),
+        changed: md_changed,
+        ..StubGit::default()
+    };
+    let (md_ctrl, _, _) = controller_with_changed_file_view(
+        markdown.path(),
+        true,
+        md_git,
+        false,
+        ChangedFileView::Content,
+    );
+    assert_eq!(
+        md_ctrl.render_seq(),
+        1,
+        "configured startup dispatches only its final render"
+    );
+    assert_eq!(
+        md_ctrl.selected_view_mode(),
+        Some(ViewMode::RenderedMarkdown),
+        "changed Markdown follows its normal rendered policy"
+    );
+
+    let source = TempDir::new();
+    std::fs::write(source.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let mut source_changed = BTreeMap::new();
+    source_changed.insert(PathBuf::from("main.rs"), Status::Modified);
+    let source_git = StubGit {
+        status: source_changed.clone(),
+        changed: source_changed,
+        ..StubGit::default()
+    };
+    let (source_ctrl, _, _) = controller_with_changed_file_view(
+        source.path(),
+        true,
+        source_git,
+        false,
+        ChangedFileView::Content,
+    );
+    assert_eq!(
+        source_ctrl.render_seq(),
+        1,
+        "configured startup does not supersede a constructor render"
+    );
+    assert_eq!(
+        source_ctrl.selected_view_mode(),
+        Some(ViewMode::SyntaxContent),
+        "changed source follows its normal syntax-content policy"
+    );
+}
+
+#[test]
+fn configured_content_view_keeps_deleted_files_diff_first() {
+    let dir = TempDir::new();
+    // Intentionally absent on disk: changed-only mode synthesizes deleted Git entries so their
+    // deletion remains reviewable.
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("gone.rs"), Status::Deleted);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    let (mut ctrl, _, _) =
+        controller_with_changed_file_view(dir.path(), true, git, false, ChangedFileView::Content);
+
+    ctrl.handle(Intent::ToggleChangedOnly);
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::Diff),
+        "a deleted path has no content to render, so its deletion diff stays the initial view"
+    );
+}
+
+#[test]
+fn configured_content_view_uses_existing_replacement_for_cached_deletion() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("kept.rs"), "fn kept() {}\n").unwrap();
+    // `git rm --cached kept.rs` can report the tracked version as deleted while leaving an
+    // untracked replacement at the same path. The existing file remains available to render.
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("kept.rs"), Status::Deleted);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    let (ctrl, _, _) =
+        controller_with_changed_file_view(dir.path(), true, git, false, ChangedFileView::Content);
+
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::SyntaxContent),
+        "an on-disk replacement follows the configured content preference"
+    );
+}
+
+#[test]
+fn configured_content_view_keeps_manual_diff_cycle_and_status_mode_semantics() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("changed.rs"), "fn main() {}\n").unwrap();
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("changed.rs"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    let (mut ctrl, _, _) =
+        controller_with_changed_file_view(dir.path(), true, git, false, ChangedFileView::Content);
+
+    assert_eq!(ctrl.selected_view_mode(), Some(ViewMode::SyntaxContent));
+    let diff_presentation = ctrl.handle(Intent::CycleDiffRender);
+    assert!(
+        !diff_presentation.redraw,
+        "D remains inert outside a diff view"
+    );
+
+    ctrl.handle(Intent::CycleView);
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::Diff),
+        "v reaches the compact diff from configured content"
+    );
+    let diff_presentation = ctrl.handle(Intent::CycleDiffRender);
+    assert!(
+        diff_presentation.redraw,
+        "D changes presentation once the selected view is a diff"
+    );
+    ctrl.handle(Intent::CycleView);
+    assert_eq!(ctrl.selected_view_mode(), Some(ViewMode::FullDiff));
+    ctrl.handle(Intent::CycleView);
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::SyntaxContent),
+        "v wraps back to configured content"
+    );
+
+    ctrl.handle(Intent::ToggleStatusMode);
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::Diff),
+        "git-status mode still forces its working-tree diff"
+    );
+}
+
+#[test]
+fn config_changed_file_view_flows_through_resolve_to_the_startup_view_policy() {
+    // Integration: config text → parse → resolve → the controller's changed-file view policy is
+    // exactly the composition `app::run` performs at startup (config resolution reaching the
+    // controller). Exercise that whole chain end-to-end, closing the gap between resolution and
+    // application: the resolver tests stop at `EffectiveSettings`, and the other
+    // `configured_content_view_*` tests supply the enum directly, so neither would notice a startup
+    // that resolved the key and then ignored it. Mirrors
+    // `config_scroll_lines_flows_through_resolve_to_the_content_wheel_step` (the literal one-line
+    // `app::run` call mirrors the pre-existing `apply_hide_dotfiles` seam).
+    use herdr_file_viewer::config::{parse_config, resolve};
+    let (cfg, _outcome) = parse_config("changed_file_view = \"content\"\n");
+    let eff = resolve(&cfg, |_| None);
+    assert_eq!(
+        eff.changed_file_view,
+        ChangedFileView::Content,
+        "config value resolves to the effective changed-file view"
+    );
+
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("README.md"), "# Changed\n").unwrap();
+    let mut changed = BTreeMap::new();
+    changed.insert(PathBuf::from("README.md"), Status::Modified);
+    let git = StubGit {
+        status: changed.clone(),
+        changed,
+        ..StubGit::default()
+    };
+    // The resolved value — not a literal — is what startup hands the constructor.
+    let (ctrl, _, _) =
+        controller_with_changed_file_view(dir.path(), true, git, false, eff.changed_file_view);
+
+    assert_eq!(
+        ctrl.selected_view_mode(),
+        Some(ViewMode::RenderedMarkdown),
+        "the resolved config changed_file_view reaches the startup view policy"
+    );
+
+    // And the default config still resolves to the original diff-first startup.
+    let (default_cfg, _) = parse_config("\n");
+    let default_eff = resolve(&default_cfg, |_| None);
+    let diff_dir = TempDir::new();
+    std::fs::write(diff_dir.path().join("README.md"), "# Changed\n").unwrap();
+    let mut diff_changed = BTreeMap::new();
+    diff_changed.insert(PathBuf::from("README.md"), Status::Modified);
+    let diff_git = StubGit {
+        status: diff_changed.clone(),
+        changed: diff_changed,
+        ..StubGit::default()
+    };
+    let (diff_ctrl, _, _) = controller_with_changed_file_view(
+        diff_dir.path(),
+        true,
+        diff_git,
+        false,
+        default_eff.changed_file_view,
+    );
+    assert_eq!(
+        diff_ctrl.selected_view_mode(),
+        Some(ViewMode::Diff),
+        "an absent key resolves to the unchanged diff-first startup"
     );
 }
 
@@ -1288,7 +1530,7 @@ fn nav_does_not_scroll_content_while_the_tree_is_focused() {
     ctrl.handle(Intent::NavDown);
     ctrl.handle(Intent::NavDown);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         0,
         "tree focus: content never scrolls"
     );
@@ -1304,18 +1546,18 @@ fn nav_scrolls_the_content_pane_when_focused_and_clamps_both_ends() {
 
     ctrl.handle(Intent::ToggleFocus);
     assert_eq!(ctrl.focus(), Focus::Content);
-    assert_eq!(ctrl.view_state().content_scroll, 0, "starts at the top");
+    assert_eq!(ctrl.view_state().active.scroll, 0, "starts at the top");
 
     ctrl.handle(Intent::NavDown);
     ctrl.handle(Intent::NavDown);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         2,
         "NavDown scrolls the content down"
     );
     ctrl.handle(Intent::NavUp);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         1,
         "NavUp scrolls the content up"
     );
@@ -1324,7 +1566,7 @@ fn nav_scrolls_the_content_pane_when_focused_and_clamps_both_ends() {
         ctrl.handle(Intent::NavUp);
     }
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         0,
         "cannot scroll above the first line"
     );
@@ -1333,7 +1575,7 @@ fn nav_scrolls_the_content_pane_when_focused_and_clamps_both_ends() {
         ctrl.handle(Intent::NavDown);
     }
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         40,
         "cannot scroll past the last screenful"
     );
@@ -1356,15 +1598,15 @@ fn page_keys_scroll_the_content_pane_by_one_viewport_and_clamp() {
 
     ctrl.handle(Intent::PageDown);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         10,
         "PageDown advances one content viewport"
     );
     ctrl.handle(Intent::PageDown);
-    assert_eq!(ctrl.view_state().content_scroll, 20, "and another");
+    assert_eq!(ctrl.view_state().active.scroll, 20, "and another");
     ctrl.handle(Intent::PageUp);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         10,
         "PageUp returns the same distance"
     );
@@ -1373,7 +1615,7 @@ fn page_keys_scroll_the_content_pane_by_one_viewport_and_clamp() {
         ctrl.handle(Intent::PageUp);
     }
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         0,
         "cannot page above the first line"
     );
@@ -1381,7 +1623,7 @@ fn page_keys_scroll_the_content_pane_by_one_viewport_and_clamp() {
         ctrl.handle(Intent::PageDown);
     }
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         40,
         "cannot page past the last screenful"
     );
@@ -1493,12 +1735,12 @@ fn selecting_a_different_file_resets_the_scroll_to_the_top() {
     for _ in 0..5 {
         ctrl.handle(Intent::NavDown);
     }
-    assert_eq!(ctrl.view_state().content_scroll, 5, "scrolled down");
+    assert_eq!(ctrl.view_state().active.scroll, 5, "scrolled down");
 
     ctrl.handle(Intent::ToggleFocus); // back to the tree
     ctrl.handle(Intent::NavDown); // select the next file
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         0,
         "a new selection resets the scroll"
     );
@@ -1515,13 +1757,16 @@ fn wrap_is_on_for_markdown_and_off_for_code() {
         ctrl_md.selected_view_mode(),
         Some(ViewMode::RenderedMarkdown)
     );
-    assert!(ctrl_md.view_state().wrap, "markdown content wraps");
+    assert!(ctrl_md.view_state().active.wrap, "markdown content wraps");
 
     let rs = TempDir::new();
     std::fs::write(rs.path().join("a.rs"), "fn main() {}\n").unwrap();
     let (ctrl_rs, _, _) = controller(rs.path(), false, StubGit::default(), false);
     assert_eq!(ctrl_rs.selected_view_mode(), Some(ViewMode::SyntaxContent));
-    assert!(!ctrl_rs.view_state().wrap, "code content does not wrap");
+    assert!(
+        !ctrl_rs.view_state().active.wrap,
+        "code content does not wrap"
+    );
 }
 
 #[test]
@@ -1541,12 +1786,12 @@ fn content_pad_left_is_on_for_the_transformed_views_and_off_for_syntax() {
         "precondition: the selected file would render as markdown"
     );
     assert!(
-        !ctrl_md.view_state().content_pad_left,
+        !ctrl_md.view_state().active.pad_left,
         "no gap until the body lands — the flag follows content_path, which is None pre-render"
     );
     await_marker(&mut ctrl_md, "stub-content");
     assert!(
-        ctrl_md.view_state().content_pad_left,
+        ctrl_md.view_state().active.pad_left,
         "rendered markdown is inset from the border once its body has landed"
     );
 
@@ -1555,7 +1800,7 @@ fn content_pad_left_is_on_for_the_transformed_views_and_off_for_syntax() {
     let (mut ctrl_rs, _, _) = controller(rs.path(), false, StubGit::default(), false);
     await_marker(&mut ctrl_rs, "stub-content");
     assert!(
-        !ctrl_rs.view_state().content_pad_left,
+        !ctrl_rs.view_state().active.pad_left,
         "syntax content stays flush (bat's gutter already gaps it)"
     );
 
@@ -1573,13 +1818,13 @@ fn content_pad_left_is_on_for_the_transformed_views_and_off_for_syntax() {
     await_marker(&mut ctrl_diff, "stub-content");
     assert_eq!(ctrl_diff.selected_view_mode(), Some(ViewMode::Diff));
     assert!(
-        ctrl_diff.view_state().content_pad_left,
+        ctrl_diff.view_state().active.pad_left,
         "a diff is inset from the border"
     );
     ctrl_diff.handle(Intent::CycleView); // Diff → FullDiff — still transformed, still inset
     await_marker(&mut ctrl_diff, "stub-content");
     assert!(
-        ctrl_diff.view_state().content_pad_left,
+        ctrl_diff.view_state().active.pad_left,
         "the full-context diff is inset too"
     );
     ctrl_diff.handle(Intent::CycleView); // FullDiff → SyntaxContent — gap drops
@@ -1589,7 +1834,7 @@ fn content_pad_left_is_on_for_the_transformed_views_and_off_for_syntax() {
         Some(ViewMode::SyntaxContent)
     );
     assert!(
-        !ctrl_diff.view_state().content_pad_left,
+        !ctrl_diff.view_state().active.pad_left,
         "cycling the diff to the syntax view drops the gap"
     );
 }
@@ -1602,13 +1847,16 @@ fn wrap_toggle_forces_wrapping_on_for_code_then_back_to_the_mode_default() {
     std::fs::write(rs.path().join("a.rs"), "fn main() {}\n").unwrap();
     let (mut ctrl, _, _) = controller(rs.path(), false, StubGit::default(), false);
 
-    assert!(!ctrl.view_state().wrap, "code does not wrap by default");
+    assert!(
+        !ctrl.view_state().active.wrap,
+        "code does not wrap by default"
+    );
     let fx = ctrl.handle(Intent::ToggleWrap);
     assert!(fx.redraw);
-    assert!(ctrl.view_state().wrap, "`w` forces wrap on for code");
+    assert!(ctrl.view_state().active.wrap, "`w` forces wrap on for code");
     ctrl.handle(Intent::ToggleWrap);
     assert!(
-        !ctrl.view_state().wrap,
+        !ctrl.view_state().active.wrap,
         "toggling again returns to the mode default"
     );
 }
@@ -1621,11 +1869,14 @@ fn w_toggles_markdown_between_the_fit_and_the_wide_unwrapped_view() {
     let md = TempDir::new();
     std::fs::write(md.path().join("a.md"), "# hi\n").unwrap();
     let (mut ctrl, _, _) = controller(md.path(), false, StubGit::default(), false);
-    assert!(ctrl.view_state().wrap, "markdown fits (wraps) by default");
+    assert!(
+        ctrl.view_state().active.wrap,
+        "markdown fits (wraps) by default"
+    );
 
     ctrl.handle(Intent::ToggleWrap);
     assert!(
-        !ctrl.view_state().wrap,
+        !ctrl.view_state().active.wrap,
         "`w` switches markdown to the wide, unwrapped (horizontal-scroll) view"
     );
     assert!(
@@ -1635,7 +1886,7 @@ fn w_toggles_markdown_between_the_fit_and_the_wide_unwrapped_view() {
 
     ctrl.handle(Intent::ToggleWrap);
     assert!(
-        ctrl.view_state().wrap,
+        ctrl.view_state().active.wrap,
         "`w` again returns markdown to the fit (wrapped) view"
     );
 }
@@ -1651,16 +1902,16 @@ fn unwrapping_markdown_does_not_force_wrap_onto_a_code_file_viewed_next() {
     let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
 
     assert!(
-        ctrl.view_state().wrap,
+        ctrl.view_state().active.wrap,
         "precondition: a.md wraps (fit view)"
     );
     ctrl.handle(Intent::ToggleWrap); // unwrap markdown → force-off everywhere
-    assert!(!ctrl.view_state().wrap);
+    assert!(!ctrl.view_state().active.wrap);
 
     ctrl.handle(Intent::NavDown); // select z.rs (code)
     assert_eq!(ctrl.selected_view_mode(), Some(ViewMode::SyntaxContent));
     assert!(
-        !ctrl.view_state().wrap,
+        !ctrl.view_state().active.wrap,
         "code stays unwrapped — the unwrap did not become a surprise wrap"
     );
 }
@@ -1693,29 +1944,29 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
     await_marker(&mut ctrl, "WIDE");
     ctrl.set_content_viewport(20, 10); // widest line 100, viewport 20 → max hscroll = 80
     assert!(
-        !ctrl.view_state().wrap,
+        !ctrl.view_state().active.wrap,
         "a .rs file does not wrap, so horizontal scroll applies"
     );
 
     ctrl.handle(Intent::ToggleFocus); // focus the content pane
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         0,
         "starts at the left edge"
     );
 
     let fx = ctrl.handle(Intent::Expand); // → scrolls right
     assert!(fx.redraw);
-    let after_one = ctrl.view_state().content_hscroll;
+    let after_one = ctrl.view_state().active.hscroll;
     assert!(after_one > 0, "→ scrolls the content right when focused");
     ctrl.handle(Intent::Expand);
     assert!(
-        ctrl.view_state().content_hscroll > after_one,
+        ctrl.view_state().active.hscroll > after_one,
         "→ again scrolls further right"
     );
     ctrl.handle(Intent::Collapse); // ← scrolls left
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         after_one,
         "← scrolls back left"
     );
@@ -1724,7 +1975,7 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
         ctrl.handle(Intent::Collapse);
     }
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         0,
         "cannot scroll left of the start"
     );
@@ -1732,7 +1983,7 @@ fn left_right_scroll_the_content_horizontally_when_focused_and_unwrapped() {
         ctrl.handle(Intent::Expand);
     }
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         80,
         "clamps at the widest line minus the viewport"
     );
@@ -1765,7 +2016,7 @@ fn wrapped_content_scrolls_vertically_to_the_bottom_and_not_horizontally() {
     );
     await_marker(&mut ctrl, "WIDE");
     ctrl.set_content_viewport(25, 10); // 5 lines × ceil(100/25)=4 = 20 wrapped rows; max = 10
-    assert!(ctrl.view_state().wrap, "a .md file wraps");
+    assert!(ctrl.view_state().active.wrap, "a .md file wraps");
 
     ctrl.handle(Intent::ToggleFocus); // focus content
     for _ in 0..500 {
@@ -1773,16 +2024,16 @@ fn wrapped_content_scrolls_vertically_to_the_bottom_and_not_horizontally() {
     }
     // Wrapped rows (20) are counted, not raw lines (5, which would clamp to 0): the bottom is
     // reachable. Exact count via ratatui means no over-scroll into blank past row 20.
-    let vmax = ctrl.view_state().content_scroll;
+    let vmax = ctrl.view_state().active.scroll;
     assert_eq!(
         vmax, 10,
         "scrolls to exactly the last wrapped row (20 rows − 10 tall)"
     );
 
-    let h_before = ctrl.view_state().content_hscroll;
+    let h_before = ctrl.view_state().active.hscroll;
     ctrl.handle(Intent::Expand); // → : would scroll right, but wrap leaves nothing to scroll past
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         h_before,
         "no horizontal scroll while wrapping"
     );
@@ -1802,14 +2053,14 @@ fn shrinking_the_viewport_reclamps_an_existing_scroll_offset() {
         ctrl.handle(Intent::NavDown);
     }
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         40,
         "scrolled to the bottom"
     );
 
     ctrl.set_content_viewport(40, 30); // taller viewport → max 20; the offset must re-clamp
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         20,
         "offset re-clamped to the new, smaller max"
     );
@@ -1914,7 +2165,14 @@ fn wide_geometry() -> PaneGeometry {
         }),
         content_vbar: None,
         content_hbar: None,
+        pinned_inner: None,
+        pinned_title_rect: None,
+        pinned_vbar: None,
+        pinned_hbar: None,
         divider_x: Some(40),
+        preview_area_x: 0,
+        preview_area_width: 0,
+        preview_divider_x: None,
         finder_rows: None,
         finder_scroll: 0,
         finder_max_hscroll: 0,
@@ -2186,14 +2444,14 @@ fn dragging_the_content_vertical_scrollbar_scrolls_the_content() {
     // Press at the bottom of the track (row 20 = track.y + height - 1) → max scroll.
     ctrl.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), vbar_col, 20));
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         30,
         "pressing the bottom of the content vbar jumps to max scroll"
     );
     // Drag to the top of the track → 0.
     ctrl.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), vbar_col, 1));
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         0,
         "dragging the content vbar to the top scrolls back to 0"
     );
@@ -3145,11 +3403,11 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
     ctrl.set_content_viewport(20, 10); // widest line 100, viewport 20 → max hscroll = 80
     ctrl.set_pane_geometry(wide_geometry());
     assert!(
-        !ctrl.view_state().wrap,
+        !ctrl.view_state().active.wrap,
         "a .rs file is unwrapped, so horizontal scroll applies"
     );
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         0,
         "starts at the left edge"
     );
@@ -3157,12 +3415,12 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
     // Wheel right over the content column (no focus change needed — scroll what's under the cursor).
     ctrl.handle_mouse(mouse(MouseEventKind::ScrollRight, 50, 5));
     assert!(
-        ctrl.view_state().content_hscroll > 0,
+        ctrl.view_state().active.hscroll > 0,
         "horizontal wheel-right scrolls the content right"
     );
     ctrl.handle_mouse(mouse(MouseEventKind::ScrollLeft, 50, 5));
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         0,
         "wheel-left scrolls back to the start"
     );
@@ -3170,7 +3428,7 @@ fn horizontal_wheel_scrolls_the_content_sideways() {
     // Over the tree, horizontal wheel is inert (the tree has no horizontal scroll).
     ctrl.handle_mouse(mouse(MouseEventKind::ScrollRight, 5, 5));
     assert_eq!(
-        ctrl.view_state().content_hscroll,
+        ctrl.view_state().active.hscroll,
         0,
         "horizontal wheel over the tree does nothing"
     );
@@ -3227,7 +3485,7 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
     ctrl.handle(Intent::NavDown);
     ctrl.handle(Intent::NavDown);
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         2,
         "scrolled down two lines"
     );
@@ -3240,7 +3498,7 @@ fn focus_gained_re_queries_git_but_preserves_content_scroll() {
         "focus-gain re-queries git"
     );
     assert_eq!(
-        ctrl.view_state().content_scroll,
+        ctrl.view_state().active.scroll,
         2,
         "focus-gain does NOT reset the content scroll"
     );
@@ -4104,73 +4362,6 @@ fn view_state_titles_the_tree_with_root_basename_and_branch() {
         "root_name is the root directory basename"
     );
     assert!(vs.branch.is_none(), "branch is None outside a git repo");
-}
-
-#[test]
-fn collapse_on_an_already_collapsed_dir_walks_up_to_the_parent() {
-    let dir = TempDir::new();
-    std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
-    std::fs::write(dir.path().join("a/b/file.txt"), "x").unwrap();
-    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
-
-    ctrl.handle(Intent::Expand); // expand "a" — cursor stays on "a"
-    ctrl.handle(Intent::NavDown); // select "b" (collapsed)
-    assert_eq!(ctrl.tree().selected().unwrap().path, dir.path().join("a/b"));
-
-    // "b" has nothing left to collapse (it's already collapsed), so Left steps up to "a"
-    // and collapses that instead of no-op'ing.
-    let fx = ctrl.handle(Intent::Collapse);
-    assert!(fx.redraw, "walking up to the parent redraws");
-    assert_eq!(
-        ctrl.tree().selected().unwrap().path,
-        dir.path().join("a"),
-        "selection moves onto the parent"
-    );
-    assert!(
-        !ctrl.tree().selected().unwrap().expanded,
-        "the parent is collapsed as part of the same keypress"
-    );
-}
-
-#[test]
-fn collapse_walk_up_climbs_past_every_row_a_compacted_chain_folds_away() {
-    // `compact_dirs` draws a run of single-child directories as ONE row keyed on the deepest
-    // directory, so the immediate filesystem parent of that row has no row of its own. The
-    // walk-up in `collapse()` has to keep climbing — not stop after one `parent()` hop — to
-    // reach "mid", the nearest directory that is actually a row.
-    let dir = TempDir::new();
-    let deep = dir.path().join("mid/chain/main/java");
-    std::fs::create_dir_all(&deep).unwrap();
-    std::fs::write(deep.join("App.java"), "x").unwrap();
-    // "mid" also holds a file, so — unlike "chain/main/java" below it — "mid" itself is never
-    // folded into a chain and keeps its own row.
-    std::fs::write(dir.path().join("mid/other.txt"), "x").unwrap();
-
-    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
-    ctrl.apply_compact_dirs(true);
-
-    ctrl.handle(Intent::Expand); // expand "mid" — cursor stays on "mid"
-    ctrl.handle(Intent::NavDown); // select the folded "chain/main/java" row (collapsed)
-    let selected = ctrl.tree().selected().unwrap();
-    assert_eq!(selected.path, dir.path().join("mid/chain/main/java"));
-    assert_eq!(selected.label.as_deref(), Some("chain/main/java"));
-
-    // Left has to climb past "main" and "chain" (neither has a row of its own — both are
-    // folded into the "chain/main/java" row) to land on "mid".
-    let fx = ctrl.handle(Intent::Collapse);
-    assert!(
-        fx.redraw,
-        "the walk-up must not silently no-op just because the first parent() hop has no row"
-    );
-    assert_eq!(
-        ctrl.tree().selected().unwrap().path,
-        dir.path().join("mid"),
-        "selection lands on the nearest ancestor that is actually a visible row"
-    );
-    assert!(
-        !ctrl.tree().selected().unwrap().expanded,
-        "mid is collapsed"
-    );
 }
 
 #[test]
@@ -9391,6 +9582,19 @@ fn slow_markdown_renderers(marker: &std::path::Path) -> Renderers {
     }
 }
 
+/// How long the stalled-renderer fixture holds once it has written its handshake.
+const STALLED_RENDERER_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest Help may take with a stalled renderer before this test calls it a regression.
+///
+/// Deliberately its own constant rather than a fraction of [`STALLED_RENDERER_WAIT`]: those two
+/// numbers answer different questions, and deriving one from the other silently changed the
+/// tolerated latency whenever the fixture's lifetime moved. 2 s is ~10x Help's own 200 ms budget
+/// (loaded-runner slack) and 30x below the stall, so it separates "fell back on the deadline" from
+/// "waited for the renderer" without measuring the runner's mood. It bounds only the WAIT; the
+/// budget's exact value is pinned clock-free in `tests/whats_new_composer.rs`.
+const HELP_STALLED_RENDERER_MAX_WAIT: Duration = Duration::from_secs(2);
+
 #[test]
 fn help_stalled_markdown_renderer_fixture() {
     if let Some(marker) = std::env::args().find_map(|argument| {
@@ -9399,14 +9603,26 @@ fn help_stalled_markdown_renderer_fixture() {
             .map(std::path::PathBuf::from)
     }) {
         std::fs::write(marker, "started").expect("fixture writes stall handshake");
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(STALLED_RENDERER_WAIT);
     }
 }
 
 #[test]
-fn open_help_uses_the_composers_single_200ms_budget() {
+fn open_help_falls_back_instead_of_waiting_for_a_stalled_renderer() {
     // T-29: a current-exe fixture writes its handshake before stalling. The handshake rules out a
     // missing/malformed renderer false positive before this test accepts Help's deadline fallback.
+    //
+    // This test owns ONE claim: opening Help does not wait on the renderer. A tight budget assertion
+    // does not belong here — `elapsed < 300ms` for a 200ms budget is a coin flip on a loaded CI
+    // runner, and it failed twice in one day on unrelated PRs before this was widened.
+    //
+    // The budget's VALUE is pinned clock-free in `tests/whats_new_composer.rs`:
+    // `one_absolute_deadline_is_shared_and_observed_remaining_decreases` asserts
+    // `WHATS_NEW_COMPOSE_TIMEOUT == 200ms` AND that every document receives exactly
+    // `opened_at + WHATS_NEW_COMPOSE_TIMEOUT` rather than a fresh timeout each, and
+    // `already_expired_open_uses_precomputed_fallbacks_without_delegation` asserts an expired
+    // deadline skips delegation entirely. Keep the budget's arithmetic there and the wait here:
+    // together they catch a widened budget (there) and a Help that blocks anyway (here).
     let dir = TempDir::new();
     let marker = std::env::temp_dir().join(format!(
         "hfv-help-stall-{}-{}",
@@ -9427,8 +9643,10 @@ fn open_help_uses_the_composers_single_200ms_budget() {
         "the current-exe renderer fixture must start and stall before Help falls back"
     );
     assert!(
-        elapsed < Duration::from_millis(300),
-        "T-29: Help must stay within its 200 ms budget plus bounded scheduling/reap slack: {elapsed:?}"
+        elapsed < HELP_STALLED_RENDERER_MAX_WAIT,
+        "T-29: Help must fall back on its own deadline, not wait for the stalled renderer \
+         (fixture holds {STALLED_RENDERER_WAIT:?}; this test tolerates \
+         {HELP_STALLED_RENDERER_MAX_WAIT:?}): {elapsed:?}"
     );
     assert!(
         ctrl.help_open(),
@@ -10280,12 +10498,14 @@ fn open_help_orders_optional_sections_after_whats_new_and_keeps_independent_scro
         hide_dotfiles: false,
         show_ignored: false,
         compact_dirs: false,
+        changed_file_view: herdr_file_viewer::view_policy::ChangedFileView::Diff,
         update_check: true,
         confirm_discard: true,
         scroll_lines: 3,
         tree_width: 30,
         tree_position: herdr_file_viewer::config::TreePosition::Left,
         tree_max_cols: 45,
+        open_direction: herdr_file_viewer::config::OpenDirection::Right,
         preview_max_lines: 5000,
         preview_max_kib: 1024,
     };

@@ -280,12 +280,14 @@ pub fn settings_text(
          hide_dotfiles     = {hide_dotfiles}\n\
          show_ignored      = {show_ignored}\n\
          compact_dirs      = {compact_dirs}\n\
+         changed_file_view = {changed_file_view}\n\
          update_check      = {update_check}\n\
          confirm_discard   = {confirm_discard}\n\
          scroll_lines      = {scroll_lines}\n\
          tree_width        = {tree_width}\n\
          tree_position     = {tree_position}\n\
          tree_max_cols     = {tree_max_cols}\n\
+         open_direction    = {open_direction}\n\
          preview_max_lines = {preview_max_lines}\n\
          preview_max_kib   = {preview_max_kib}",
         open = open,
@@ -293,12 +295,14 @@ pub fn settings_text(
         hide_dotfiles = eff.hide_dotfiles,
         show_ignored = eff.show_ignored,
         compact_dirs = eff.compact_dirs,
+        changed_file_view = eff.changed_file_view.label(),
         update_check = update_check,
         confirm_discard = confirm_discard,
         scroll_lines = eff.scroll_lines,
         tree_width = eff.tree_width,
         tree_position = eff.tree_position.label(),
         tree_max_cols = eff.tree_max_cols,
+        open_direction = eff.open_direction.label(),
         preview_max_lines = eff.preview_max_lines,
         preview_max_kib = eff.preview_max_kib,
     )
@@ -800,12 +804,14 @@ mod tests {
             hide_dotfiles: true,
             show_ignored: true,
             compact_dirs: true,
+            changed_file_view: crate::view_policy::ChangedFileView::Content,
             update_check: false,
             confirm_discard: false,
             scroll_lines: 7,
             tree_width: 25,
             tree_position: crate::config::TreePosition::Right,
             tree_max_cols: 50,
+            open_direction: crate::config::OpenDirection::Down,
             preview_max_lines: 8000,
             preview_max_kib: 2048,
         }
@@ -839,11 +845,13 @@ mod tests {
             "hide_dotfiles",
             "show_ignored",
             "compact_dirs",
+            "changed_file_view",
             "update_check",
             "scroll_lines",
             "tree_width",
             "tree_position",
             "tree_max_cols",
+            "open_direction",
             "preview_max_lines",
             "preview_max_kib",
         ] {
@@ -873,6 +881,13 @@ mod tests {
             text.lines()
                 .any(|l| l.trim_start().starts_with("tree_max_cols") && l.contains("50")),
             "settings_text must show the effective tree_max_cols value (50):\n{text}"
+        );
+        // The launcher-facing split direction is shown too: the fixture sets `down`, so a row
+        // reading `right` would mean the config value never reached the overlay.
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("open_direction") && l.contains("down")),
+            "settings_text must show the effective open_direction (down):\n{text}"
         );
         // The effective content-preview caps each appear as their own row with their value.
         assert!(
@@ -906,6 +921,7 @@ mod tests {
             "hide_dotfiles     = true",
             "show_ignored      = true",
             "compact_dirs      = true",
+            "changed_file_view = content",
             "update_check      = off",
             "scroll_lines      = 7",
         ] {
@@ -984,6 +1000,7 @@ mod tests {
             "hide_dotfiles     = false",
             "show_ignored      = false",
             "compact_dirs      = false",
+            "changed_file_view = diff",
             "update_check      = on",
             "confirm_discard   = on",
             &format!(
@@ -996,6 +1013,7 @@ mod tests {
                 "tree_max_cols     = {}",
                 crate::config::DEFAULT_TREE_MAX_COLS
             ),
+            "open_direction    = right",
             &format!(
                 "preview_max_lines = {}",
                 crate::config::DEFAULT_PREVIEW_MAX_LINES
@@ -1265,6 +1283,40 @@ mod tests {
             !text.contains("ignored (using defaults)"),
             "a clean default outcome must not show an ignored-bindings line:\n{text}"
         );
+    }
+
+    #[test]
+    fn keybindings_text_reports_the_effective_pin_preview_binding() {
+        // T-13: the generated Help model reads the resolved bindings, not the registry default.
+        let (bindings, outcome) = resolve_one("pin_preview", "P");
+        let text = keybindings_text(input::registry(), &bindings, &outcome);
+        let row = text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("pin_preview"))
+            .expect("Help must contain the pin_preview action");
+        assert!(row.split_whitespace().any(|word| word == "P"));
+        assert!(row.contains("(custom)"));
+    }
+
+    #[test]
+    fn keybindings_text_lists_the_pinned_preview_resize_defaults() {
+        // The generated Help model is sourced from the registry, so the two resize actions remain
+        // discoverable alongside pin_preview without a second hand-maintained key list.
+        let text = keybindings_text(
+            input::registry(),
+            &input::default_bindings(),
+            &input::KeyLoadOutcome::default(),
+        );
+        for (name, key) in [("shrink_preview", "{"), ("grow_preview", "}")] {
+            let row = text
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(name))
+                .unwrap_or_else(|| panic!("Help must contain the {name} action"));
+            assert!(
+                row.split_whitespace().any(|word| word == key),
+                "{name} must show its default {key:?}:\n{row}"
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ customize it see [configuration](configuration.md).
 - [Finding a file fast](#finding-a-file-fast)
 - [Open at a known file](#open-at-a-known-file) (incl. [Teach your agent](#teach-your-agent))
 - [Viewing a file](#viewing-a-file)
+- [Pinned previews](#pinned-previews)
 - [Git awareness](#git-awareness)
 - [Navigating within a file](#navigating-within-a-file)
 - [Annotating files and ranges](#annotating-files-and-ranges)
@@ -30,14 +31,10 @@ setting off unless you need it; `.git/` itself always stays hidden. The tree's *
 looking.
 
 Move the cursor with `↑`/`↓` (or `k`/`j`), expand/collapse a directory with `→`/`←` (or `l`/`h`) or
-`Enter`. `←` on a file, or on a directory that's already collapsed, has nothing left to collapse
-there — it walks the cursor up to the nearest visible ancestor directory and collapses that instead,
-so repeated presses climb the tree one level at a time; under `compact_dirs` this correctly skips
-past every folded intermediate directory to land on the next real row. The tree scrolls to keep the
-selection in view, and sideways for long or deeply-nested names — reachable by keyboard with `H` /
-`L` when the tree is focused. A scrollbar appears whenever there's more than fits. Narrow or widen
-the tree column with `<` / `>`, or drag the divider; the starting split, the tree's side, and a
-column cap are all [configurable](configuration.md).
+`Enter`. The tree scrolls to keep the selection in view, and sideways for long or deeply-nested
+names — reachable by keyboard with `H` / `L` when the tree is focused. A scrollbar appears whenever
+there's more than fits. Narrow or widen the tree column with `<` / `>`, or drag the divider; the
+starting split, the tree's side, and a column cap are all [configurable](configuration.md).
 
 On a **deeply nested** layout the per-segment tree spends most of a narrow column on indentation, and
 the file names — the part you came for — are what gets truncated. Set
@@ -50,7 +47,8 @@ that one, and the chain stops the moment a directory holds a file or a second en
 
 Press `f` to open a **fuzzy finder** over every file in the tree (`.gitignore`-aware). Type to
 filter, `↑`/`↓` to move, `Enter` to open, `Esc` to cancel — far faster than scrolling the tree in a
-large repo.
+large repo. Confirming from a pinned preview moves focus to the active preview where the chosen
+file opens.
 
 ## Open at a known file
 
@@ -167,9 +165,11 @@ This is launch-only. It does not retarget a Files pane that is already running; 
 
 ## Viewing a file
 
-The content pane shows **the right view for each file, automatically**: a changed file shows its
-**diff**, a markdown file **renders**, anything else is **syntax-highlighted** content with line
-numbers. No mode-switching, no commands.
+The content pane shows **the right view for each file, automatically**: by default a changed file
+shows its **diff**, a markdown file **renders**, and anything else is **syntax-highlighted** content
+with line numbers. Set [`changed_file_view = "content"`](configuration.md) if changed files should
+start in their normal file-type view instead (rendered Markdown or syntax content); deleted paths
+remain diff-first because no file content remains to display.
 
 - **Cycle the view** with `v` to override the automatic choice (e.g. see a changed markdown file's
   raw source instead of its diff).
@@ -190,6 +190,43 @@ numbers. No mode-switching, no commands.
 Rendering is **delegated** to `glow` (markdown), `delta` (diffs), and `bat` (syntax); when a
 renderer isn't installed the viewer falls back to plain text with a short notice. See
 [external renderers](renderers.md).
+
+## Pinned previews
+
+Press `p` on a settled file preview to keep a **frozen in-memory snapshot** beside the file you
+continue browsing. The snapshot is session-only: it does not reread the file, change after `r`, or
+follow later renders. Press `p` again on the same file to unpin it; press it on a different settled
+file to replace the reference. A directory, an empty tree, or a preview still rendering cannot be
+pinned.
+
+Every pin carries its **captured origin** — the branch, or detached state, it was taken on — in its
+title, as `Pinned: [main]`. The captured path is not in the title; it would clip the origin away on
+a narrow pane, and `y`/`Y` copy it anyway. When the pin comes from a **different worktree** than the
+one you are viewing, the title names that worktree too, as `Pinned: [main @ other-checkout]`, so a
+foreign reference can never be mistaken for a local one. A pin from the worktree you are already in
+names no worktree, since repeating it buys nothing. It therefore **survives a worktree switch** and
+remains useful even if its old worktree is no longer selected: after such a switch the same pin
+starts naming the worktree it came from. While the pin is focused, `y` copies its **captured repo-relative path** and
+`Y` its **captured absolute path**; neither operation reads the current tree or the old file again.
+
+With the tree visible, `Tab` cycles focus **tree → active preview → pinned preview → tree**. In
+tree-hidden zoom the cycle is active preview then pinned preview. The pinned and active previews
+have separate scroll positions and searches are independent: arrows, paging, `/`, and `n`/`N`
+operate only on the focused preview. On a narrow pane, pinning never takes a pane away: the tree
+and active preview retain the no-pin layout, the hidden pin persists, and the active preview says
+`Pinned: <path> — widen to view` until there is room for both **40-column floor** previews. `Tab`
+then visits only the visible tree and active preview.
+
+The reference is display-only. Actions that need the live selection — including `Enter`, `:`, `e`,
+`L`, `O`, `R`, `a`, `A`, `v`, `D`, `w`, and `Z` — are **unavailable from the pinned preview** and
+show a short notice; `Tab` to the active preview or tree to use them. This keeps a frozen reference
+from silently acting on a newer tree selection.
+
+Use `{` / `}` to shrink or grow the pin in 5-point steps (20–80%) without moving the tree/content
+split. They move the **preview divider** between the pinned and active previews and do nothing when
+there is no pin. You can also **drag the preview divider** with the mouse; it is separate from the
+outer tree/content divider (`<` / `>`). Each preview has its own scrollbars, which you can drag or
+press just as you would the active content scrollbar.
 
 ## Git awareness
 
@@ -226,7 +263,7 @@ Git status is woven straight into the tree, not a separate mode:
 
 Git is read through the system `git` CLI (read-only subcommands only). Without git on `PATH` the
 viewer still opens, but the status markers, filter, baseline, and diffs are degraded — see
-[install](install.md).
+[install](install.md). git 2.39 (Apple's Xcode git) is supported.
 
 ## Navigating within a file
 

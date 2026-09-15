@@ -1,7 +1,7 @@
 # Configuration
 
-An optional TOML config file lets you override the editor, the renderer/opener commands, a couple
-of startup toggles, the tree layout, and the keybindings. **Read-only input** — the viewer never
+An optional TOML config file lets you override the editor, the renderer/opener commands, startup
+view and tree preferences, and the keybindings. **Read-only input** — the viewer never
 writes this file; edit it in your own editor and relaunch to pick up changes (there is no in-app
 settings editor). You can see what's currently in effect any time in the `?` help overlay's
 **Settings** section: each row shows the effective value (after config/env/default precedence). The
@@ -47,8 +47,8 @@ A config key always wins. Only two keys also have an environment-variable fallba
 config key and above the built-in default — `editor` (`$EDITOR`) and `update_check`
 (`$HERDR_FILE_VIEWER_NO_UPDATE_CHECK`) — giving those two a `config > env > default` chain. Every
 other key (`markdown`, `diff`, `syntax`, `open`, `reveal`, `hide_dotfiles`, `show_ignored`,
-`compact_dirs`, `confirm_discard`, `scroll_lines`, `tree_width`, `tree_position`, `tree_max_cols`,
-`preview_max_lines`, `preview_max_kib`) has no
+`compact_dirs`, `changed_file_view`, `confirm_discard`, `scroll_lines`, `tree_width`,
+`tree_position`, `tree_max_cols`, `open_direction`, `preview_max_lines`, `preview_max_kib`) has no
 applicable environment variable; for those it's `config > default` only.
 
 ## Keys
@@ -68,12 +68,14 @@ reveal = "nautilus"
 hide_dotfiles = false       # true to hide dotfiles at startup (the `.` key still toggles)
 show_ignored = false        # true to show gitignored files at startup (the `i` key still toggles)
 compact_dirs = false        # true to draw a chain of single-child dirs as ONE row (src/main/java)
+changed_file_view = "diff"  # changed files start in "diff", or use normal "content" by file type
 update_check = true         # false disables all remote requests and their display
 confirm_discard = true      # false to discard annotations without confirming (on quit / worktree switch)
 scroll_lines = 3            # mouse-wheel step (content/search/help), a 1 to 10 scale: 1 slow · 3 medium · 6 fast · 10 max
 tree_width = 30             # tree column's share of the viewer pane, percent 20-80 (content takes the rest)
 tree_max_cols = 30          # HARD CAP in columns; the SMALLER of this and tree_width% wins (raise both to widen)
 tree_position = "left"      # which side the directory tree sits on: "left" (default) or "right"
+open_direction = "right"    # which way the summon key splits your pane: "right" (default) or "down"
 
 preview_max_lines = 10000   # show at most this many lines before a truncated preview (100–100000)
 preview_max_kib = 1024      # ...or this size before truncating, in KiB (1024 = 1 MB; 64–65536)
@@ -84,6 +86,15 @@ and their display. When the key is unset, `$HERDR_FILE_VIEWER_NO_UPDATE_CHECK` a
 No separate spotlight setting exists.
 The system `curl` is optional: without it, document retrieval is unavailable without an error.
 
+`changed_file_view` controls only the automatic initial view for Git-changed files. Its default,
+`"diff"`, preserves the existing diff-first policy. Set it to `"content"` to apply the same normal
+file-type policy used by unchanged files: Markdown opens rendered, while source and text files open
+in syntax content. Deleted paths remain diff-first because they have no on-disk content to render.
+This does not force raw source for Markdown. The `v` cycle still includes compact and full-file diff
+views, and the setting does not change Git status markers, changed-only filtering, the active
+baseline, git-status mode (`d`), or `D`'s unified/side-by-side/plain diff presentation. Values are
+trimmed and case-insensitive; an unrecognized value falls back defensively to `"diff"`.
+
 `tree_width` and `tree_max_cols` **together** decide the tree's startup width, and the **smaller of
 the two wins**: the tree is drawn at `min(tree_width% of the pane, tree_max_cols)`. So if you set
 `tree_width = 50` and nothing changes, `tree_max_cols` (default 30 columns) is capping it: raise
@@ -93,6 +104,15 @@ instead of a mostly-blank tree (it only bites past ~100 columns). `tree_position
 the `left` (default) or `right`. All three set the **startup** split inside the viewer's own pane
 (not the herdr pane, which the host decides); you can still resize live with the grow/shrink keys or
 by dragging the divider, and an explicit resize lifts the cap.
+
+`open_direction` is the one layout key that *does* reach the herdr pane. It chooses which way the
+summon action splits the pane you invoke it from: `"right"` (the default — viewer beside your work)
+or `"down"` (viewer underneath, terminal keeping the top half). `"bottom"` is accepted as a synonym
+for `"down"`; values are trimmed and case-insensitive, and anything unrecognized falls back to
+`"right"`. Two scoping notes: the **tab** action (`open-file-viewer-tab`) ignores it, because a tab
+has no direction; and the launcher reads it at summon time, so it applies to the **next** viewer you
+open, not to one already on screen. See [Summoning the viewer](summoning.md) for the actions
+themselves.
 
 `preview_max_lines` and `preview_max_kib` cap how much of a file the content pane shows: a file is
 displayed in full until it exceeds **either** cap, then the pane shows a truncated preview with a
@@ -185,8 +205,11 @@ customized).
 | | `toggle_focus` | `Tab` | Move focus between the tree and content columns |
 | | `shrink_tree` | `<` | Narrow the tree column |
 | | `grow_tree` | `>` | Widen the tree column |
+| | `shrink_preview` | `{` | Give the pinned preview less horizontal space |
+| | `grow_preview` | `}` | Give the pinned preview more horizontal space |
 | | `toggle_wrap` | `w` | Force content-line wrapping on or off |
 | | `toggle_zoom` | `z` | Hide the tree so content fills the frame, or restore the split |
+| | `pin_preview` | `p` | Pin or unpin the settled preview as a reference |
 | | `tree_scroll_left` | `H` | Scroll the tree pane left |
 | | `tree_scroll_right` | `L` | Scroll the tree pane right |
 | **Git & filters** | `toggle_ignore` | `i` | Reveal or hide gitignored files |
@@ -222,7 +245,7 @@ and annotation-overview `j`/`k`/arrows, `Enter`/`e`, `d`, uppercase `D`, `y`, `E
 the finder and `:` / `/` prompts. Remapping a global action never changes these local modal keys.
 
 **Bindable keys** are the modifier-free surface the viewer already uses: any printable or shifted
-character (`g`, `<`, `?`, and capitals such as `A`, `D`, and `W` are each their own key), plus the named keys
+character (`g`, `<`, `{`, `?`, and capitals such as `A`, `D`, and `W` are each their own key), plus the named keys
 `Tab`, `Enter`, `Esc`, the four arrows, `Home`, `End`, `PageUp`, `PageDown`, `Space`, `Backspace`,
 `Delete`, `Insert`, and `F1` through `F12` (named keys are matched case-insensitively). There are
 **no `Ctrl` / `Alt` chords**: a chord never fires a viewer action, so terminal combinations like
@@ -242,6 +265,12 @@ config was malformed. Whatever you configure, **`Esc` always closes** the viewer
 rebound away, so you can never strand yourself (you may still move the `q` Close key or any other
 action). Only the global keys are remappable; keys handled inside a modal (including line-select
 and the annotation editor/overview) keep their fixed keys.
+
+Shifted characters are distinct bindings, so `p`, `{`, and `}` are valid values for `pin_preview`,
+`shrink_preview`, and `grow_preview` respectively; the latter two resize the pinned preview's share
+at the preview divider. On Windows, AltGr typing continues to reach whichever character binding you
+configure (including a shifted character), rather than being treated as a `Ctrl`/`Alt` shortcut; see
+the [AltGr note](keys.md#keys) for the platform-specific input details.
 
 See your bindings in effect any time in the `?` help overlay's **Keybindings** section. It groups
 the actions into sections and shows, for each, its config-var name (the `[keys]` id you type to

@@ -13,10 +13,13 @@ use herdr_file_viewer::controller::{
 };
 use herdr_file_viewer::git::{Baseline, Status};
 use herdr_file_viewer::intent::Intent;
+use herdr_file_viewer::presenter::Focus;
+use herdr_file_viewer::preview::BranchState;
 use herdr_file_viewer::view_policy::ViewMode;
 use ratatui::text::Text;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +41,118 @@ impl ContentProvider for SlowContent {
             notices: Vec::new(),
             source: None,
         }
+    }
+}
+
+/// A renderer whose every render blocks until the test releases it, and which reports when each
+/// render has actually STARTED.
+///
+/// This is what makes the superseded-result race forceable instead of hoped for: the test can hold
+/// a render open, dispatch a newer one behind it, then release the first so its result reaches
+/// `poll` while a newer seq is current — the exact ordering `poll`'s `seq == latest_seq` guard
+/// exists to reject, which no amount of sleeping can reliably produce.
+struct GatedContent {
+    started_tx: mpsc::Sender<String>,
+    release_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+impl ContentProvider for GatedContent {
+    fn render(&self, path: &Path, _mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.started_tx
+            .send(name.clone())
+            .expect("test observes render start");
+        self.release_rx
+            .lock()
+            .expect("release gate")
+            .recv()
+            .expect("test releases the render");
+        RenderResult {
+            content: Text::raw(format!("rendered:{name}")),
+            notices: Vec::new(),
+            source: None,
+        }
+    }
+}
+
+/// AC-23 / the `seq == latest_seq` guard in `poll`: a render result that is SUPERSEDED before it
+/// lands must be dropped, never applied.
+///
+/// The two end-to-end superseded-render tests below cannot prove this — their polling loop drains
+/// the earlier result while waiting for the newest, so removing the guard does not fail them. This
+/// one forces the ordering directly: `a.rs` is held mid-render while `b.rs` is dispatched behind
+/// it, so when `a.rs` is released its result arrives carrying a stale seq. Verified to fail when
+/// the guard is removed.
+#[test]
+fn a_result_superseded_before_it_lands_is_dropped_by_poll() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel::<String>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(GatedContent {
+                started_tx: started_tx.clone(),
+                release_rx: Arc::clone(&release_rx),
+            }),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+
+    // a.rs's render is now RUNNING and blocked inside the provider (observed, not assumed).
+    assert_eq!(
+        started_rx.recv().expect("a.rs render starts"),
+        "a.rs",
+        "the initial selection renders first"
+    );
+
+    // Dispatch b.rs behind it: `latest_seq` moves on while a.rs's result does not yet exist.
+    ctrl.handle(Intent::NavDown);
+    assert_eq!(
+        flatten(ctrl.content()),
+        LOADING_PLACEHOLDER,
+        "precondition: b.rs is selected and still rendering"
+    );
+
+    // Release a.rs: its result is produced and sent NOW, carrying the superseded seq.
+    release_tx.send(()).expect("release a.rs");
+    // b.rs's render starting is proof the worker has finished sending a.rs's result — the ordered
+    // worker takes the next job only after the previous one is sent. So the stale result is
+    // already sitting in the channel, waiting for `poll`, with no sleeping involved.
+    assert_eq!(
+        started_rx.recv().expect("b.rs render starts"),
+        "b.rs",
+        "the worker moved on to b.rs, so a.rs's stale result has been sent"
+    );
+
+    ctrl.poll();
+    assert_eq!(
+        flatten(ctrl.content()),
+        LOADING_PLACEHOLDER,
+        "a superseded result must be DROPPED by poll, not applied to the newer selection"
+    );
+
+    // And the newest result still lands normally, so the guard drops stale work without breaking
+    // the live path.
+    release_tx.send(()).expect("release b.rs");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        ctrl.poll();
+        if flatten(ctrl.content()) == "rendered:b.rs" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "b.rs never landed");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -170,6 +285,109 @@ fn flatten(text: &Text) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn an_applied_render_exposes_one_complete_active_preview_document() {
+    struct CompleteContent;
+    impl ContentProvider for CompleteContent {
+        fn render(&self, path: &Path, mode: ViewMode, _raw_diff: Option<&str>) -> RenderResult {
+            let body = format!(
+                "rendered:{}:{mode:?}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            RenderResult {
+                content: Text::raw(body.clone()),
+                notices: vec!["bounded fallback notice".into()],
+                source: Some(vec![body]),
+            }
+        }
+    }
+
+    let dir = TempDir::new();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let components = Components {
+        providers: Box::new(|_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(CompleteContent),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_contains(&mut ctrl, "rendered:a.rs:SyntaxContent");
+
+    let document = ctrl
+        .active_document()
+        .expect("a settled file render is one complete preview document");
+    assert_eq!(flatten(document.content()), "rendered:a.rs:SyntaxContent");
+    assert_eq!(document.notices(), ["bounded fallback notice"]);
+    assert_eq!(
+        document.source(),
+        Some(["rendered:a.rs:SyntaxContent".to_string()].as_slice())
+    );
+    assert_eq!(document.presentation().view_mode(), ViewMode::SyntaxContent);
+    assert!(!document.presentation().wrap());
+    assert!(!document.presentation().pad_left());
+    assert_eq!(document.origin().root(), dir.path());
+    assert_eq!(document.origin().branch(), &BranchState::Detached);
+    assert_eq!(document.origin().absolute_path(), path);
+    assert_eq!(document.origin().root_relative_path(), Path::new("a.rs"));
+}
+
+#[test]
+fn pinning_while_the_new_selection_is_rendering_rejects_without_capturing_it() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.rs"), "1\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "2\n").unwrap();
+    let components = Components {
+        providers: Box::new(move |_resolved| RootProviders {
+            git: Arc::new(NoGit),
+            content: Box::new(SlowContent {
+                delay: Duration::from_millis(80),
+            }),
+        }),
+        editor: Box::new(NoEditor),
+        clipboard: Box::new(common::RecordingClipboard::default()),
+        renderers: None,
+    };
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        components,
+    );
+    await_contains(&mut ctrl, "rendered:a.rs");
+    ctrl.pin_active_preview();
+    let original = ctrl
+        .view_state()
+        .pinned
+        .expect("settled initial selection was pinned")
+        .origin
+        .expect("pin retains initial identity");
+
+    ctrl.handle(Intent::NavDown);
+    assert!(
+        ctrl.view_state().active.rendering,
+        "b.rs render is in flight"
+    );
+    assert!(ctrl.pin_active_preview().redraw);
+    assert_eq!(
+        ctrl.action_notice(),
+        Some("Cannot pin while preview is rendering")
+    );
+    assert_eq!(
+        ctrl.view_state()
+            .pinned
+            .expect("rejection keeps existing pin")
+            .origin,
+        Some(original)
+    );
 }
 
 #[test]
@@ -327,13 +545,22 @@ fn a_superseded_render_does_not_overwrite_a_newer_selection() {
         assert!(Instant::now() < deadline, "final selection never rendered");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Give any stale (a.rs/b.rs) results a chance to wrongly land, then re-check.
-    std::thread::sleep(Duration::from_millis(50));
+    // No sleep, and none needed: renders run on ONE worker thread (`Controller::spawn_worker`) that
+    // takes jobs in order and collapses a backlog, so c.rs's result having landed means every
+    // earlier job already completed or was collapsed away. Nothing can arrive afterwards.
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
         "rendered:c.rs",
         "a superseded render must not overwrite the newer selection"
+    );
+    let document = ctrl
+        .active_document()
+        .expect("the latest settled file remains the active document");
+    assert_eq!(
+        document.origin().root_relative_path(),
+        Path::new("c.rs"),
+        "a stale result cannot replace the active document's captured identity"
     );
 }
 
@@ -432,7 +659,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
     }
     // Precondition: a.rs is the displayed file — its name is the content title.
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("a.rs"),
         "precondition: a.rs content landed, title is a.rs"
     );
@@ -461,7 +688,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
     // (b) The title has NOT jumped to b.rs ahead of its body — it still names the displayed
     //     content's file (a.rs).
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("a.rs"),
         "the content title does not update ahead of the body — it stays on the displayed file \
          (a.rs) until b.rs's render lands"
@@ -485,7 +712,7 @@ fn a_slow_render_shows_a_loading_placeholder_and_switches_title_with_body() {
         "the selected file's rendered content arrived"
     );
     assert_eq!(
-        ctrl.view_state().content_title.as_deref(),
+        ctrl.view_state().active.title.as_deref(),
         Some("b.rs"),
         "the title switched to b.rs together with its body"
     );
@@ -531,7 +758,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
-        !ctrl.view_state().content_pad_left,
+        !ctrl.view_state().active.pad_left,
         "precondition: the displayed code file has no gap"
     );
 
@@ -544,7 +771,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         "precondition: b.md's render is in flight"
     );
     assert!(
-        !ctrl.view_state().content_pad_left,
+        !ctrl.view_state().active.pad_left,
         "the gap does not flip on ahead of the body — it tracks the displayed a.rs, not selected b.md"
     );
 
@@ -559,7 +786,7 @@ fn the_left_gap_follows_the_displayed_file_not_the_selection_during_a_slow_rende
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
-        ctrl.view_state().content_pad_left,
+        ctrl.view_state().active.pad_left,
         "once the markdown body lands, the gap is on"
     );
 }
@@ -630,7 +857,14 @@ fn a_superseded_render_does_not_overwrite_the_loading_placeholder_nor_the_pane()
         assert!(Instant::now() < deadline, "c.rs render never landed");
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(50));
+    // No sleep: the single ordered worker means c.rs landing implies b.rs's job already completed
+    // or was collapsed, so no stale result can arrive after this point.
+    //
+    // Scope, so this is not over-trusted: it does NOT prove `poll`'s `seq == latest_seq` guard.
+    // Removing that guard does not fail it, because the polling loop above drains b.rs's earlier
+    // result while waiting for c.rs. The guard is proved separately, by forcing the ordering with a
+    // gated renderer, in `a_result_superseded_before_it_lands_is_dropped_by_poll`. This stays an
+    // end-to-end sanity check of the happy path.
     ctrl.poll();
     assert_eq!(
         flatten(ctrl.content()),
@@ -745,9 +979,17 @@ fn a_width_change_reflows_markdown_at_the_new_width_but_a_height_change_does_not
     );
 
     // A height-only change (same width) must NOT reflow — no further render is dispatched.
+    // `render_seq` is bumped synchronously inside dispatch, BEFORE the worker spawns, so an
+    // unchanged seq proves the absence outright; the delegate count is corroboration, not the
+    // oracle (it lags the dispatch by a thread hop, so on its own it would pass vacuously).
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 14);
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) reflow time to land
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a height-only change must not dispatch a re-render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -790,6 +1032,8 @@ fn a_width_reflow_preserves_scroll_and_recomputes_a_committed_search() {
     ctrl.scroll_to_line(20);
     let scrolled = ctrl.content_scroll();
     assert!(scrolled > 0, "precondition: scrolled away from the top");
+    let before_document = ctrl.active_document().unwrap().clone();
+    let before_search = ctrl.search().cloned();
 
     // Resize narrower (a width change) → reflow. Scroll and the committed search must survive.
     ctrl.set_content_viewport(30, 10);
@@ -806,6 +1050,94 @@ fn a_width_reflow_preserves_scroll_and_recomputes_a_committed_search() {
     assert!(
         !search.matches.is_empty(),
         "the search is recomputed against the reflowed content"
+    );
+    let after_document = ctrl.active_document().unwrap();
+    assert_ne!(
+        after_document.content(),
+        before_document.content(),
+        "the reflow replaces the active document's rendered body"
+    );
+    assert_eq!(
+        after_document.origin(),
+        before_document.origin(),
+        "a width reflow retains the render job's captured file identity"
+    );
+    assert_eq!(
+        ctrl.search().map(|state| state.query.as_str()),
+        before_search.as_ref().map(|state| state.query.as_str()),
+        "the active interaction's committed query survives document replacement"
+    );
+}
+
+/// A width reflow lands for the ACTIVE preview even while a Search prompt is open on the PINNED
+/// preview, and the active side's committed search must still be recomputed against the reflowed
+/// body. `refresh_search` routes by `prompt_target`, so a pinned prompt speaks only for the frozen
+/// pinned snapshot; taking that branch for an active reflow left the active matches computed against
+/// the pre-reflow rendered lines (wrong highlights, `n`/`N` jumping to stale rows).
+///
+/// The ordering is forced, not raced: `set_content_viewport` dispatches the reflow synchronously,
+/// the pinned prompt is opened before any `poll`, and only then is the result drained — so the
+/// result provably lands with the pinned prompt open.
+#[test]
+fn a_width_reflow_recomputes_the_active_search_while_a_pinned_search_prompt_is_open() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("doc.md"), "# hi\n").unwrap();
+    let widths = Arc::new(Mutex::new(Vec::new()));
+    let mut ctrl = Controller::new(
+        common::resolved(dir.path().to_path_buf(), false),
+        Baseline::Head,
+        width_probe_components(Arc::clone(&widths), 50),
+    );
+    await_contains(&mut ctrl, "w=None:doc.md");
+    ctrl.set_content_viewport(40, 10);
+    await_contains(&mut ctrl, "w=Some(40):doc.md");
+
+    // Pin the settled active preview, then commit an ACTIVE search for a token that exists only in
+    // the width-40 body, so a recompute is observably different from carrying the stale match over.
+    ctrl.pin_active_preview();
+    ctrl.handle(Intent::OpenSearch);
+    for c in "Some(40)".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    ctrl.handle_prompt_key(key(KeyCode::Enter));
+    assert_eq!(
+        ctrl.search().map(|s| s.matches.len()),
+        Some(1),
+        "precondition: the committed active search matches the width-40 body once"
+    );
+
+    // Dispatch the reflow, THEN open a Search prompt on the pinned preview, and only then drain.
+    ctrl.set_content_viewport(30, 10);
+    // Cycle the focus ring (Tree → Content → Pinned) rather than assuming where a committed search
+    // left it; the ring is bounded, so a full lap proves the pinned region is focusable at all.
+    for _ in 0..3 {
+        if ctrl.focus() == Focus::Pinned {
+            break;
+        }
+        ctrl.handle(Intent::ToggleFocus);
+    }
+    assert_eq!(
+        ctrl.focus(),
+        Focus::Pinned,
+        "precondition: focus moved to the pinned preview"
+    );
+    ctrl.handle(Intent::OpenSearch);
+    for c in "line".chars() {
+        ctrl.handle_prompt_key(key(KeyCode::Char(c)));
+    }
+    await_contains(&mut ctrl, "w=Some(30):doc.md");
+
+    let active = ctrl
+        .active_interaction()
+        .search
+        .as_ref()
+        .expect("the active committed search survives the reflow");
+    assert_eq!(active.query, "Some(40)", "the active query is untouched");
+    assert!(
+        active.matches.is_empty(),
+        "the active search must be recomputed against the reflowed body, not left pointing at \
+         pre-reflow rendered lines: {:?}",
+        active.matches
     );
 }
 
@@ -825,8 +1157,15 @@ fn a_width_change_does_not_reflow_non_markdown() {
     await_contains(&mut ctrl, "w=None:a.rs");
 
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.set_content_viewport(50, 10); // width change, but the selection is code, not markdown
-    std::thread::sleep(Duration::from_millis(50));
+    // Synchronous proof of absence; see the height-only case above for why the count alone is not
+    // the oracle.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "a resize must not dispatch a re-render for a width-independent view"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
@@ -879,13 +1218,19 @@ fn toggle_wrap_on_a_code_file_dispatches_no_render() {
     await_contains(&mut ctrl, "w=None:a.rs");
     ctrl.set_content_viewport(50, 10); // code view is width-independent → no reflow
     let before = widths.lock().unwrap().len();
+    let seq_before = ctrl.render_seq();
     ctrl.handle(Intent::ToggleWrap); // toggle wrap on a code file
-    std::thread::sleep(Duration::from_millis(50)); // give any (wrong) dispatch time to land
+    // Synchronous proof of absence: the seq is bumped inside dispatch before the worker spawns.
+    assert_eq!(
+        ctrl.render_seq(),
+        seq_before,
+        "toggling wrap on a code file must not dispatch a render"
+    );
     ctrl.poll();
     assert_eq!(
         widths.lock().unwrap().len(),
         before,
-        "toggling wrap on a code file must not dispatch a render"
+        "and no delegate call may land afterwards"
     );
 }
 
